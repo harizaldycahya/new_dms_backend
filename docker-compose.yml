@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: dms
+      POSTGRES_PASSWORD: dms_dev_password
+      POSTGRES_DB: dms
+    ports:
+      - "5432:5432"
+    volumes:
+      - dms_pgdata:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+volumes:
+  dms_pgdata:
