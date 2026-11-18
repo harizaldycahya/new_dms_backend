@@ -6,6 +6,8 @@ import { z } from 'zod'
 import { pool } from '../../db.js'
 import { env } from '../../env.js'
 import { requireAuth, type AuthUser } from '../../middleware/auth.js'
+import { getAccess } from '../../middleware/access.js'
+
 
 export const authRouter = Router()
 
@@ -89,6 +91,12 @@ authRouter.post('/auth/sso/exchange', async (req, res) => {
 })
 
 /* ---------- Cek sesi ---------- */
-authRouter.get('/auth/me', requireAuth, (req, res) => {
-  res.json({ user: req.user })
+authRouter.get('/auth/me', requireAuth, async (req, res, next) => {
+  try {
+    const access = await getAccess(req.user!.id)
+    if (!access) return res.status(401).json({ message: 'Sesi tidak valid, silakan login ulang' })
+    res.json(access) // { user, menus }
+  } catch (e) {
+    next(e)
+  }
 })
