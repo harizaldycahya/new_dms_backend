@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { pool } from '../../db.js'
 import { requireAuth } from '../../middleware/auth.js'
 import { requireMenu } from '../../middleware/access.js'
+import { runCoreSync, SyncError } from '../core/cores.routes.js'
 
 export const cableRouter = Router()
 
@@ -189,6 +190,27 @@ cableRouter.get(
       ),
     ])
     res.json({ segments: segments.rows, sections: sections.rows })
+  }),
+)
+
+/* ---------- Combined sync: parent first, then core ---------- */
+cableRouter.post(
+  '/cable/sync',
+  canEdit,
+  wrap(async (_req, res) => {
+    // 1) parent sync (Project/Segment/Section) goes HERE, and must be
+    //    committed before core runs, because core is matched through
+    //    project_id -> segment_id -> section_id + route_id.
+    //    (not available yet: no parent sync code exists)
+
+    // 2) core sync
+    try {
+      const cores = await runCoreSync()
+      res.json({ cores })
+    } catch (e) {
+      if (e instanceof SyncError) return res.status(e.status).json({ message: e.message })
+      throw e
+    }
   }),
 )
 

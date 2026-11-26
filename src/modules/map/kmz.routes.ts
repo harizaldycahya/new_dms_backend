@@ -1,12 +1,13 @@
 import { Router, type NextFunction, type Request, type Response } from 'express'
 import multer from 'multer'
-import JSZip from 'jszip'
 import { randomBytes } from 'node:crypto'
 import { pool } from '../../db.js'
 import { requireAuth, requireRole, type AuthUser } from '../../middleware/auth.js'
 import { hashFeatures, parseKmz, styleKey, type ParsedFeature, type ParsedKmz, type ParsedSection, type PointStyle } from './kmz.parser.js'
-import { buildWorkbook, parseSheet, type ExportFeature } from './sheet.parser.js'
+import { parseSheet } from './sheet.parser.js'
 import { requireMenu } from '../../middleware/access.js'
+import { removedSamples } from './kmz.diff.js'
+import { registerPreviewGeometry } from './kmz.geometry.js'
 import { registerDeleteMapData } from './kmz.delete.js'
 import { registerMapSummary } from './kmz.summary.js'
 import { registerMapExport } from './kmz.export.js'
@@ -29,10 +30,8 @@ const wrap =
     fn(req, res).catch(next)
 
 registerDeleteMapData(mapRouter, canEdit, wrap)
-registerDeleteMapData(mapRouter, canEdit, wrap)
 registerMapSummary(mapRouter, canEdit, wrap)
 registerMapExport(mapRouter, canEdit, wrap)
-registerMapSummary(mapRouter, canEdit, wrap)
 
 const MAX_UPLOAD_MB = 100
 const STAGE_TTL_MS = 15 * 60 * 1000
@@ -77,6 +76,7 @@ type SectionResult = {
   /** none = nothing is lost, warn = some current objects disappear, high = probably a mistake, needs an explicit acknowledgement */
   risk: Risk
   risk_reasons: string[]
+  removed_samples: { name: string | null; category: string | null; geom_type: string }[]
 }
 
 type Impact = {
@@ -286,6 +286,7 @@ async function classify(db: Db, projectPk: string, parsed: ParsedKmz): Promise<C
       removed: a?.removed ?? 0,
       risk: (a?.risk ?? 'none') as Risk,
       risk_reasons: a?.reasons ?? [],
+      removed_samples: a && a.removed > 0 ? removedSamples(old, s.features) : [],
     }
     if (hits.length === 0) {
       return { ...base, section_pk: null, segment_pk: null, old_count: 0, status: 'error', message: 'Not in the Master Cable. Add it in the Master Cable first or fix the ID' }
@@ -351,164 +352,7 @@ setInterval(() => {
   for (const [k, v] of staged) if (v.expires < now) staged.delete(k)
 }, 60_000).unref()
 
-/* =====================================================================
-   Export / template KMZ
-   ===================================================================== */
-
-const xmlEsc = (s: string) =>
-  // eslint-disable-next-line no-control-regex
-  s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').replace(/[&<>"']/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c]!,
-  )
-
-type Coords = [number, number]
-const coordStr = (c: Coords) => `${c[0]},${c[1]},0`
-
-// IconStyle in KML: color is aabbggrr, the icon is a standard Google Earth icon (opens correctly in Google Earth)
-function styleXml(st: PointStyle | null): string {
-  if (!st) return ''
-  const c = /^[0-9a-f]{6}$/.test(st.color) ? st.color : 'ffffff'
-  const color = `ff${c.slice(4, 6)}${c.slice(2, 4)}${c.slice(0, 2)}`
-  const icon =
-    st.icon !== 'custom' && /^[A-Za-z0-9_/-]+$/.test(st.icon)
-      ? `<Icon><href>http://maps.google.com/mapfiles/kml/${st.icon}.png</href></Icon>`
-      : ''
-  return `<Style><IconStyle><color>${color}</color><scale>${Number(st.scale) || 1}</scale>${icon}</IconStyle></Style>`
-}
-
-function placemark(name: string | null, geomType: string, g: unknown, st: PointStyle | null = null): string {
-  const nm = name ? `<name>${xmlEsc(name)}</name>` : ''
-  if (geomType === 'Point') {
-    return `<Placemark>${nm}${styleXml(st)}<Point><coordinates>${coordStr(g as Coords)}</coordinates></Point></Placemark>`
-  }
-  if (geomType === 'LineString') {
-    return `<Placemark>${nm}<LineString><coordinates>${(g as Coords[]).map(coordStr).join(' ')}</coordinates></LineString></Placemark>`
-  }
-  const rings = g as Coords[][]
-  const ring = (r: Coords[]) => `<LinearRing><coordinates>${r.map(coordStr).join(' ')}</coordinates></LinearRing>`
-  const inner = rings.slice(1).map((r) => `<innerBoundaryIs>${ring(r)}</innerBoundaryIs>`).join('')
-  return `<Placemark>${nm}<Polygon><outerBoundaryIs>${ring(rings[0])}</outerBoundaryIs>${inner}</Polygon></Placemark>`
-}
-
-type CatNode = { items: string[]; kids: Map<string, CatNode> }
-const newNode = (): CatNode => ({ items: [], kids: new Map() })
-
-function renderNode(n: CatNode): string {
-  let out = n.items.join('')
-  for (const [name, k] of n.kids) out += `<Folder><name>${xmlEsc(name)}</name>${renderNode(k)}</Folder>`
-  return out
-}
-
-mapRouter.get(
-  '/map/projects/:projectPk/export',
-  canEdit,
-  wrap(async (req, res) => {
-    const projectPk = req.params.projectPk as string
-    const { rows: pr } = await pool.query(
-      'SELECT project_id, name FROM projects WHERE pk = $1 AND deleted_at IS NULL',
-      [projectPk],
-    )
-    if (!pr[0]) return res.status(404).json({ message: 'Project not found' })
-
-    const { rows: secs } = await pool.query(
-      `SELECT s.pk AS seg_pk, s.segment_id, s.name AS seg_name,
-              x.pk AS sec_pk, x.section_id, x.name AS sec_name
-         FROM segments s
-         LEFT JOIN sections x ON x.segment_pk = s.pk AND x.deleted_at IS NULL
-        WHERE s.project_pk = $1 AND s.deleted_at IS NULL
-        ORDER BY s.segment_id, x.section_id`,
-      [projectPk],
-    )
-
-    const { rows: feats } = await pool.query(
-      `SELECT f.section_pk, f.name, f.category, f.geom_type, f.style,
-              ST_AsGeoJSON(f.geom, 7)::json -> 'coordinates' AS coordinates
-         FROM map_features f
-         JOIN sections x ON x.pk = f.section_pk AND x.deleted_at IS NULL
-         JOIN segments s ON s.pk = x.segment_pk AND s.deleted_at IS NULL
-        WHERE s.project_pk = $1 AND f.replaced_at IS NULL
-        ORDER BY f.section_pk, f.seq, f.pk`,
-      [projectPk],
-    )
-
-    // Excel: same data as rows (see sheet.parser.ts), opens in any spreadsheet app
-    if (String(req.query.format ?? '').toLowerCase() === 'xlsx') {
-      const secInfo = new Map<string, { segment_id: string; section_id: string }>()
-      for (const r of secs) if (r.sec_pk) secInfo.set(String(r.sec_pk), { segment_id: r.segment_id, section_id: r.section_id })
-      const rowsOut: ExportFeature[] = feats.map((f) => ({
-        segment_id: secInfo.get(String(f.section_pk))!.segment_id,
-        section_id: secInfo.get(String(f.section_pk))!.section_id,
-        name: f.name,
-        category: f.category,
-        geom_type: f.geom_type,
-        coordinates: f.coordinates,
-        style: f.style as PointStyle | null,
-      }))
-      const xlsx = await buildWorkbook(
-        { id: pr[0].project_id, name: pr[0].name },
-        secs
-          .filter((r) => r.sec_pk)
-          .map((r) => ({ segment_id: r.segment_id, segment_name: r.seg_name, section_id: r.section_id, name: r.sec_name })),
-        rowsOut,
-      )
-      const safeX = String(pr[0].project_id).replace(/[^A-Za-z0-9._-]/g, '_')
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-      res.setHeader('Content-Disposition', `attachment; filename="${safeX}.xlsx"`)
-      return res.send(xlsx)
-    }
-
-    const treeBySection = new Map<string, CatNode>()
-    for (const f of feats) {
-      const root = treeBySection.get(f.section_pk) ?? newNode()
-      treeBySection.set(f.section_pk, root)
-      let node = root
-      if (f.category) {
-        for (const part of String(f.category).split('/')) {
-          let next = node.kids.get(part)
-          if (!next) {
-            next = newNode()
-            node.kids.set(part, next)
-          }
-          node = next
-        }
-      }
-      node.items.push(placemark(f.name, f.geom_type, f.coordinates, f.style as PointStyle | null))
-    }
-
-    const segments = new Map<string, { id: string; name: string; sections: string[] }>()
-    for (const r of secs) {
-      const seg = segments.get(r.seg_pk) ?? { id: r.segment_id as string, name: r.seg_name as string, sections: [] as string[] }
-      segments.set(r.seg_pk, seg)
-      if (r.sec_pk) {
-        const body = treeBySection.get(r.sec_pk) ? renderNode(treeBySection.get(r.sec_pk)!) : ''
-        seg.sections.push(`<Folder><name>${xmlEsc(String(r.section_id))}</name>${body}</Folder>`)
-      }
-    }
-
-    const hint =
-      'Folder names are the IDs from the Master Cable. Do not rename or move the Project, Segment, and Section folders. ' +
-      'Put points/lines/polygons inside the Section folders (subfolders are allowed). ' +
-      'A Section with an empty folder leaves its existing data unchanged.'
-    const body = [...segments.values()]
-      .map((s) => `<Folder><name>${xmlEsc(String(s.id))}</name>${s.sections.join('')}</Folder>`)
-      .join('')
-    const p = pr[0]
-    const kml =
-      `<?xml version="1.0" encoding="UTF-8"?>\n` +
-      `<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>${xmlEsc(p.project_id)}</name>` +
-      `<Folder><name>${xmlEsc(String(p.project_id))}</name><description>${xmlEsc(hint)}</description>${body}</Folder>` +
-      `</Document></kml>`
-
-    const zip = new JSZip()
-    zip.file('doc.kml', kml)
-    const out = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' })
-
-    const safe = String(p.project_id).replace(/[^A-Za-z0-9._-]/g, '_')
-    res.setHeader('Content-Type', 'application/vnd.google-earth.kmz')
-    res.setHeader('Content-Disposition', `attachment; filename="${safe}.kmz"`)
-    res.send(out)
-  }),
-)
+registerPreviewGeometry(mapRouter, canEdit, wrap, (t) => staged.get(t))
 
 /* =====================================================================
    Upload: preview (parse + cocokkan, belum menyimpan)

@@ -123,21 +123,4 @@ export function registerDeleteMapData(router: Router, canEdit: RequestHandler, w
     }),
   )
 
-  /**
-   * Endpoint lama (level Project saja), dipertahankan supaya modal yang ada tetap jalan.
-   * Akan dihapus di 1d.
-   */
-  router.delete(
-    '/map/projects/:projectPk/map-data',
-    canEdit,
-    wrap(async (req, res) => {
-      try {
-        const confirm = typeof req.body?.confirm === 'string' ? req.body.confirm : ''
-        const r = await performDelete([{ level: 'project', pk: String(req.params.projectPk) }], confirm, req.user!.id)
-        res.json({ ok: r.ok, upload_pk: r.upload_pk, features_removed: r.features_removed })
-      } catch (e) {
-        return fail(res, e)
-      }
-    }),
-  )
 }

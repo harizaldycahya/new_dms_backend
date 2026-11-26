@@ -75,6 +75,8 @@ const lname = (n: El) => (n.localName ?? n.nodeName.split(':').pop() ?? '').toLo
 const kids = (n: El): El[] => Array.from(n.childNodes).filter(isEl)
 const child = (n: El, name: string) => kids(n).find((c) => lname(c) === name)
 const childText = (n: El, name: string) => (child(n, name)?.textContent ?? '').trim()
+const placemarks = (n: number) => `${n} placemark${n === 1 ? '' : 's'}`
+
 
 /** Nama folder = ID saja (mis. "SEC-1"). Format lama "ID | Nama" tetap diterima. */
 export function splitFolderName(raw: string): { id: string; name: string } | null {
@@ -291,8 +293,9 @@ export function parseKml(xml: string, expectedProjectId?: string): ParsedKmz {
     errors.push('The KMZ contains no folders. Use the template downloaded from DMS')
     return result
   }
-  if (kids(top).some((k) => lname(k) === 'placemark')) {
-    warnings.push('Placemarks outside the Project folder are ignored')
+  const looseTop = kids(top).filter((k) => lname(k) === 'placemark').length
+  if (looseTop > 0) {
+    warnings.push(`${placemarks(looseTop)} outside the Project folder ${looseTop === 1 ? 'is' : 'are'} ignored`)
   }
 
   if (!expectedProjectId && projectFolders.length > 1) {
@@ -323,8 +326,9 @@ export function parseKml(xml: string, expectedProjectId?: string): ParsedKmz {
     result.projectId = pn.id
     result.projectName = pn.name
 
-    if (kids(pf).some((k) => lname(k) === 'placemark')) {
-      warnings.push('Placemarks directly inside the Project folder are ignored')
+    const looseProject = kids(pf).filter((k) => lname(k) === 'placemark').length
+    if (looseProject > 0) {
+      warnings.push(`${placemarks(looseProject)} directly inside the Project folder ${looseProject === 1 ? 'is' : 'are'} ignored`)
     }
 
     for (const sf of kids(pf).filter((k) => lname(k) === 'folder')) {
@@ -333,8 +337,10 @@ export function parseKml(xml: string, expectedProjectId?: string): ParsedKmz {
         errors.push(`Folder Segment "${childText(sf, 'name')}" has no ID (the folder name must be its ID)`)
         continue
       }
-      if (kids(sf).some((k) => lname(k) === 'placemark')) {
-        warnings.push(`Placemarks directly inside Segment "${sn.id}" are ignored`)
+      
+      const looseSegment = kids(sf).filter((k) => lname(k) === 'placemark').length
+      if (looseSegment > 0) {
+        warnings.push(`${placemarks(looseSegment)} directly inside Segment "${sn.id}" ${looseSegment === 1 ? 'is' : 'are'} ignored`)
       }
 
       for (const cf of kids(sf).filter((k) => lname(k) === 'folder')) {
