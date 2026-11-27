@@ -13,6 +13,7 @@ import { customerRouter } from './modules/customer/customer.routes.js'
 import { sectionCustomerRouter } from './modules/customer/sectionCustomer.routes.js'
 import { cmCutRouter } from './modules/cm-cut/cm-cut.routes.js'
 import { serpoSectionRouter } from './modules/serpo-section/serpoSection.routes.js'
+import { rootCauseRouter } from './modules/master-ticket/rootCause.routes.js'
 
 export const app = express()
 
@@ -33,6 +34,7 @@ app.use(cmCutRouter)
 app.use(soRouter)
 app.use(serpoSectionRouter)
 app.use(mapDataRouter)
+app.use(rootCauseRouter)
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
