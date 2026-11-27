@@ -14,7 +14,6 @@ import { sectionCustomerRouter } from './modules/customer/sectionCustomer.routes
 import { cmCutRouter } from './modules/cm-cut/cm-cut.routes.js'
 import { serpoSectionRouter } from './modules/serpo-section/serpoSection.routes.js'
 
-
 export const app = express()
 
 app.use(cors({ origin: env.corsOrigin }))
